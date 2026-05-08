@@ -15,7 +15,7 @@ const apiClient = axios.create({
 export const uploadVideo = async (videoFile, modelPath = '') => {
   try {
     const formData = new FormData();
-    formData.append('file', videoFile);
+    formData.append('video', videoFile);
     if (modelPath) {
       formData.append('model_path', modelPath);
     }
