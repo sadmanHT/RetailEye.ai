@@ -3,13 +3,17 @@ import uuid
 import json
 import shutil
 import sys
+import asyncio
+import base64
+import cv2
 from pathlib import Path
 from datetime import datetime
 from contextlib import asynccontextmanager
 from typing import Dict, Any, Optional
 
-from fastapi import FastAPI, BackgroundTasks, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, BackgroundTasks, UploadFile, File, Form, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 # Ensure pipeline_runner is discoverable from api/
@@ -208,3 +212,92 @@ async def health_check() -> HealthResponse:
         status="ok",
         timestamp=datetime.now().isoformat()
     )
+
+
+@app.websocket("/ws/live/{job_id}")
+async def live_feed(websocket: WebSocket, job_id: str):
+    """
+    Simulates a live CCTV feed by processing video in real time
+    and streaming frames back to the frontend via WebSocket.
+    """
+    await websocket.accept()
+    if job_id not in JOB_STORE:
+        await websocket.close(code=1008)
+        return
+        
+    job_state = JOB_STORE[job_id]
+    result_path = job_state.get("result_path")
+    
+    if not result_path or not Path(result_path).exists():
+        await websocket.close(code=1008)
+        return
+        
+    json_path = Path(result_path).with_suffix('.json')
+    analytics_data = {}
+    if json_path.exists():
+        try:
+            with open(json_path, "r") as f:
+                analytics_data = json.load(f)
+        except:
+            pass
+
+    try:
+        cap = cv2.VideoCapture(result_path)
+        fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+        frame_number = 0
+        
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
+                
+            _, buffer = cv2.imencode('.jpg', frame)
+            frame_b64 = base64.b64encode(buffer).decode('utf-8')
+            
+            # Simplified mock analytics payload; 
+            # ideally interpolated per frame timestamp
+            payload = {
+                "frame": frame_b64,
+                "frame_number": frame_number,
+                "timestamp": frame_number / fps,
+                "analytics": {
+                    "total_people": analytics_data.get("summary_metrics", {}).get("total_unique_people", 0)
+                }
+            }
+            
+            await websocket.send_json(payload)
+            frame_number += 1
+            await asyncio.sleep(1 / 25.0)
+
+        cap.release()
+        await websocket.close()
+    except WebSocketDisconnect:
+        print(f"Client disconnected from live feed {job_id}")
+    except Exception as e:
+        print(f"WebSocket error: {e}")
+        try:
+            await websocket.close()
+        except:
+            pass
+
+
+@app.get("/stream/video/{job_id}")
+async def stream_video(job_id: str):
+    """
+    Returns the output video as a StreamingResponse for direct video playback.
+    """
+    if job_id not in JOB_STORE:
+        raise HTTPException(status_code=404, detail="Job ID not found.")
+        
+    job_state = JOB_STORE[job_id]
+    result_path = job_state.get("result_path")
+    
+    if not result_path or not Path(result_path).exists():
+        raise HTTPException(status_code=404, detail="Video file not found or not processed yet.")
+        
+    def iterfile():
+        with open(result_path, mode="rb") as file_like:
+            yield from file_like
+
+    return StreamingResponse(iterfile(), media_type="video/mp4")
+
